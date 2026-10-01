@@ -66,6 +66,23 @@ class RevocationRequest(BaseModel):
     reason: str = Field(default="", max_length=2000)
 
 
+class SuspensionRequest(BaseModel):
+    # Temporary equipment downtime: take an approved, non-revoked license out
+    # of the effective set.  Shares revision arbitration with every other
+    # writer; the expected revision is mandatory.
+    expected_revision: int = Field(ge=0)
+    reason: str = Field(default="", max_length=2000)
+
+
+class ResumptionRequest(BaseModel):
+    # Restore a suspended license after re-adjudication against the current
+    # guard band and all effective licenses.  Shares revision arbitration;
+    # a stale revision or renewed interference leaves it suspended and
+    # consumes no revision.
+    expected_revision: int = Field(ge=0)
+    reason: str = Field(default="", max_length=2000)
+
+
 class GuardBandPreviewRequest(BaseModel):
     # Proposed guard band to dry-run against the current effective set.
     # Finite/non-negative checks run in semantic_validation so they use the

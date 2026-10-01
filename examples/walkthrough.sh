@@ -155,3 +155,45 @@ post "/api/applications/$F_ID/available-ranges" \
 post "/api/applications/999999/available-ranges" \
   '{"candidate_low_min":180,"candidate_low_max":430}' | J || true
 curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision is still", d["current_revision"])'
+
+echo "== 26. suspend C (temporary device outage): leaves the effective set, one revision (8) =="
+post "/api/applications/$C_ID/suspend" \
+  '{"expected_revision":7,"reason":"device downtime"}' | J
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("effective =", d["effective_application_ids"], "suspended =", d["suspended_application_ids"])'
+
+echo "== 27. while C is suspended, a device I overlapping C's band [205,208] can be approved (9) =="
+I=$(post /api/applications '{
+  "name":"Device I",
+  "circle":{"cx":0,"cy":0,"radius":1000},
+  "frequency":{"low":205,"high":208},
+  "time_window":{"start":"2026-10-01T13:00:00Z","end":"2026-10-01T18:00:00Z"}
+}')
+I_ID=$(echo "$I" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post "/api/applications/$I_ID/preview" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("has_conflicts =", d["has_conflicts"], "(C is suspended)")'
+post "/api/applications/$I_ID/approve" '{"expected_revision":8}' | J
+
+echo "== 28. resume C re-adjudicates: clashes with I -> 409 interference, C stays suspended =="
+post "/api/applications/$C_ID/resume" '{"expected_revision":9}' | J || true
+post "/api/applications/$C_ID/resume" '{"expected_revision":9}' >/dev/null || true
+echo "    a stale resume returns the current revision and changes nothing either:"
+post "/api/applications/$C_ID/resume" '{"expected_revision":8}' | J || true
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision is still", d["current_revision"], "; C status =", [a["status"] for a in d["suspended_applications"]])'
+
+echo "== 29. permanently revoke I (revision 10), then resume C succeeds (revision 11) =="
+post "/api/applications/$I_ID/revoke" '{"reason":"obsolete"}' | J
+post "/api/applications/$C_ID/resume" \
+  '{"expected_revision":10,"reason":"fault cleared"}' | J
+
+echo "== 30. history restores suspend/resume records and each effective set =="
+curl -s "$BASE/api/revision/8" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("rev 8: effective =", d["effective_application_ids"], "suspended =", d["suspended_application_ids"], "suspensions =", [(s["revision"], s["application_id"]) for s in d["suspensions"]])'
+curl -s "$BASE/api/revision/9" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("rev 9: effective =", d["effective_application_ids"], "suspended =", d["suspended_application_ids"])'
+curl -s "$BASE/api/revision/11" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("rev 11: effective =", d["effective_application_ids"], "suspended =", d["suspended_application_ids"]); print("        suspensions =", [(s["revision"], s["application_id"]) for s in d["suspensions"]], "resumptions =", [(s["revision"], s["application_id"], s["guard_band"]) for s in d["resumptions"]], "revocations =", [(s["revision"], s["application_id"]) for s in d["revocations"]])'
+
+echo "== 31. unknown ids and illegal states are refused without consuming a revision =="
+post /api/applications/999999/suspend '{"expected_revision":11}' | J || true
+post "/api/applications/$H_ID/suspend" '{"expected_revision":11}' | J || true
+post "/api/applications/$D_ID/resume" '{"expected_revision":11}' | J || true
+post "/api/applications/$C_ID/suspend" '{"expected_revision":11}' >/dev/null
+post "/api/applications/$C_ID/suspend" '{"expected_revision":12}' | J || true
+post "/api/applications/$C_ID/resume" '{"expected_revision":12}' >/dev/null
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision =", d["current_revision"], "(the rejections consumed none)")'

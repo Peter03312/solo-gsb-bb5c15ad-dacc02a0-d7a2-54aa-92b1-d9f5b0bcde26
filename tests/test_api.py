@@ -991,6 +991,32 @@ class TestGuardBandConfig:
         )
         assert ok.status_code == 200 and ok.json()["revision"] == 5
 
+    def test_preview_ignores_suspended_licenses(self, client):
+        # A and B would clash under a wider band; suspending A removes it
+        # from the effective set that the guard-band preview checks.
+        a = self._submit(client, "A", freq=(100, 110))
+        b = self._submit(client, "B", freq=(113, 114))  # gap 3
+        self._approve(client, a, 0)
+        self._approve(client, b, 1)
+        client.post(
+            f"/api/applications/{a}/suspend",
+            json={"expected_revision": 2},
+        ).raise_for_status()
+
+        preview = client.post(self.PREVIEW, json={"guard_band": 4.0}).json()
+        assert preview["current_revision"] == 3
+        assert preview["effective_application_ids"] == [b]
+        assert preview["has_conflicts"] is False
+        assert preview["interfering_pairs"] == []
+
+        # once A is resumed the pair shows up again
+        client.post(
+            f"/api/applications/{a}/resume", json={"expected_revision": 3}
+        ).raise_for_status()
+        preview2 = client.post(self.PREVIEW, json={"guard_band": 4.0}).json()
+        assert preview2["effective_application_ids"] == [a, b]
+        assert preview2["interfering_pair_count"] == 1
+
     def test_batch_approval_uses_the_new_band(self, client):
         a = self._submit(client, "A", freq=(100, 110))
         b = self._submit(client, "B", freq=(112.5, 113))  # intra-group gap 2.5
@@ -1019,3 +1045,398 @@ class TestGuardBandConfig:
                 == "pending"
             )
         assert client.get("/api/revision/current").json()["current_revision"] == 1
+
+
+class TestSuspendResume:
+    """POST .../suspend and .../resume: temporary equipment outages."""
+
+    def _submit(self, client, name, **kw):
+        return client.post(
+            "/api/applications", json=body(name=name, **kw)
+        ).json()["id"]
+
+    def _approve(self, client, app_id, expected):
+        r = client.post(
+            f"/api/applications/{app_id}/approve",
+            json={"expected_revision": expected},
+        )
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def _suspend(self, client, app_id, expected, **kw):
+        return client.post(
+            f"/api/applications/{app_id}/suspend",
+            json={"expected_revision": expected, **kw},
+        )
+
+    def _resume(self, client, app_id, expected, **kw):
+        return client.post(
+            f"/api/applications/{app_id}/resume",
+            json={"expected_revision": expected, **kw},
+        )
+
+    def test_suspend_consumes_one_revision_and_leaves_effective_set(
+        self, client
+    ):
+        a = self._submit(client, "A", freq=(100, 110))
+        self._approve(client, a, 0)
+
+        r = self._suspend(client, a, 1, reason="device downtime")
+        assert r.status_code == 200, r.text
+        body_ = r.json()
+        assert body_["suspended"] is True
+        assert body_["revision"] == 2
+        assert body_["previous_approval_revision"] == 1
+        assert body_["reason"] == "device downtime"
+        assert body_["application"]["status"] == "suspended"
+        assert body_["application"]["suspended_revision"] == 2
+        assert body_["application"]["approval_revision"] == 1
+
+        app_a = client.get(f"/api/applications/{a}").json()
+        assert app_a["status"] == "suspended"
+        assert app_a["suspended_revision"] == 2
+
+        current = client.get("/api/revision/current").json()
+        assert current["current_revision"] == 2
+        assert current["effective_application_ids"] == []
+        assert current["suspended_application_ids"] == [a]
+        assert current["suspensions"] == [
+            {
+                "revision": 2,
+                "application_id": a,
+                "reason": "device downtime",
+                "created_at": current["suspensions"][0]["created_at"],
+            }
+        ]
+        assert current["resumptions"] == []
+
+        # the status filter finds it
+        suspended = client.get("/api/applications?status=suspended").json()
+        assert [x["id"] for x in suspended["applications"]] == [a]
+
+    def test_resume_consumes_one_revision_and_restores_license(self, client):
+        a = self._submit(client, "A", freq=(100, 110))
+        self._approve(client, a, 0)
+        self._suspend(client, a, 1).raise_for_status()
+
+        r = self._resume(client, a, 2, reason="fault cleared")
+        assert r.status_code == 200, r.text
+        body_ = r.json()
+        assert body_["resumed"] is True
+        assert body_["revision"] == 3
+        assert body_["original_approval_revision"] == 1
+        assert body_["guard_band"] == 2.0
+        assert body_["reason"] == "fault cleared"
+        assert body_["application"]["status"] == "approved"
+        assert body_["application"]["suspended_revision"] is None
+
+        # the original approval revision is unchanged: no new application
+        app_a = client.get(f"/api/applications/{a}").json()
+        assert app_a["status"] == "approved"
+        assert app_a["approval_revision"] == 1
+        assert app_a["suspended_revision"] is None
+
+        current = client.get("/api/revision/current").json()
+        assert current["current_revision"] == 3
+        assert current["effective_application_ids"] == [a]
+        assert current["suspended_application_ids"] == []
+        (resume_event,) = current["resumptions"]
+        assert resume_event["revision"] == 3
+        assert resume_event["application_id"] == a
+        assert resume_event["guard_band"] == 2.0
+        assert resume_event["reason"] == "fault cleared"
+
+    def test_suspension_changes_preview_and_available_ranges(self, client):
+        a = self._submit(client, "A", freq=(100, 110))
+        b = self._submit(client, "B", freq=(105, 108))
+        self._approve(client, a, 0)
+
+        prev = client.post(f"/api/applications/{b}/preview").json()
+        assert prev["has_conflicts"] is True
+
+        # while A is suspended, B sees an empty effective set
+        self._suspend(client, a, 1).raise_for_status()
+        prev2 = client.post(f"/api/applications/{b}/preview").json()
+        assert prev2["current_revision"] == 2
+        assert prev2["has_conflicts"] is False
+        ranges = client.post(
+            f"/api/applications/{b}/available-ranges",
+            json={"candidate_low_min": 90, "candidate_low_max": 130},
+        ).json()
+        assert ranges["available_ranges"] == [
+            {"min": 90, "max": 130, "min_inclusive": True, "max_inclusive": True}
+        ]
+
+        # after A is resumed B is blocked again
+        self._resume(client, a, 2).raise_for_status()
+        prev3 = client.post(f"/api/applications/{b}/preview").json()
+        assert prev3["current_revision"] == 3
+        assert prev3["has_conflicts"] is True
+
+    def test_stale_suspension_returns_current_revision_and_changes_nothing(
+        self, client
+    ):
+        a = self._submit(client, "A")
+        b = self._submit(client, "B", freq=(200, 201))
+        self._approve(client, a, 0)
+        self._approve(client, b, 1)
+
+        # expected 1 but a second approval already moved the revision to 2
+        r = self._suspend(client, a, 1)
+        assert r.status_code == 409
+        err = r.json()["error"]
+        assert err["code"] == "stale_revision"
+        assert err["details"] == {"expected_revision": 1, "current_revision": 2}
+        # still effective, revision unchanged
+        assert client.get(f"/api/applications/{a}").json()["status"] == "approved"
+        current = client.get("/api/revision/current").json()
+        assert current["current_revision"] == 2
+        assert current["effective_application_ids"] == [a, b]
+        assert current["suspensions"] == []
+
+    def test_resume_interference_keeps_suspended_and_consumes_no_revision(
+        self, client
+    ):
+        a = self._submit(client, "A", freq=(100, 110))
+        self._approve(client, a, 0)
+        self._suspend(client, a, 1).raise_for_status()
+
+        # a new overlapping license C is approved while A is suspended
+        c = self._submit(client, "C", freq=(105, 108))
+        self._approve(client, c, 2)
+
+        r = self._resume(client, a, 3)
+        assert r.status_code == 409
+        err = r.json()["error"]
+        assert err["code"] == "interference"
+        assert err["details"]["current_revision"] == 3
+        (conflict,) = err["details"]["conflicts"]
+        assert conflict["application"]["id"] == c
+        assert conflict["reason"] == "frequency_intersection"
+
+        # A stays suspended; no revision consumed; C stays effective
+        assert client.get(f"/api/applications/{a}").json()["status"] == "suspended"
+        current = client.get("/api/revision/current").json()
+        assert current["current_revision"] == 3
+        assert current["effective_application_ids"] == [c]
+        assert current["suspended_application_ids"] == [a]
+        assert current["resumptions"] == []
+
+        # removing the blocker lets the resume succeed on the same revision
+        client.post(f"/api/applications/{c}/revoke", json={}).raise_for_status()
+        ok = self._resume(client, a, 4)
+        assert ok.status_code == 200
+        assert ok.json()["revision"] == 5
+
+    def test_resume_uses_the_current_guard_band(self, client):
+        a = self._submit(client, "A", freq=(100, 110))
+        self._approve(client, a, 0)
+        self._suspend(client, a, 1).raise_for_status()
+        # widen the guard band while A is suspended: gap to C is exactly 2
+        client.post(
+            "/api/config/guard-band",
+            json={"guard_band": 3.0, "expected_revision": 2},
+        ).raise_for_status()
+        c = self._submit(client, "C", freq=(112, 113))
+        # gap 2 >= old band 2 but < new band 3: approvable while A suspended
+        self._approve(client, c, 3)
+
+        r = self._resume(client, a, 4)
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "interference"
+        (conflict,) = r.json()["error"]["details"]["conflicts"]
+        assert conflict["application"]["id"] == c
+        assert conflict["reason"] == "within_guard_band"
+        # a successful resumption keeps the band it was re-decided under
+        client.post(f"/api/applications/{c}/revoke", json={}).raise_for_status()
+        ok = self._resume(client, a, 5)
+        assert ok.status_code == 200
+        assert ok.json()["guard_band"] == 3.0
+        snap = client.get(f"/api/revision/{ok.json()['revision']}").json()
+        assert snap["resumptions"][0]["guard_band"] == 3.0
+
+    def test_duplicate_suspend_and_resume_rejected(self, client):
+        a = self._submit(client, "A")
+        self._approve(client, a, 0)
+        self._suspend(client, a, 1).raise_for_status()
+
+        again = self._suspend(client, a, 2)
+        assert again.status_code == 409
+        err = again.json()["error"]
+        assert err["code"] == "already_suspended"
+        assert err["details"] == {"suspended_at_revision": 2}
+
+        self._resume(client, a, 2).raise_for_status()
+        again2 = self._resume(client, a, 3)
+        assert again2.status_code == 409
+        assert again2.json()["error"]["code"] == "not_suspended"
+        assert again2.json()["error"]["details"] == {"status": "approved"}
+
+        # neither rejection consumed a revision
+        assert (
+            client.get("/api/revision/current").json()["current_revision"] == 3
+        )
+
+    def test_suspend_pending_or_revoked_and_resume_invalid_states(self, client):
+        a = self._submit(client, "A")  # pending
+        r = self._suspend(client, a, 0)
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "not_approved"
+        assert r.json()["error"]["details"] == {"status": "pending"}
+
+        r2 = self._resume(client, a, 0)
+        assert r2.status_code == 409
+        assert r2.json()["error"]["code"] == "not_suspended"
+        assert r2.json()["error"]["details"] == {"status": "pending"}
+
+        # revoke a suspended license: permanent, resume is then refused
+        self._approve(client, a, 0)
+        self._suspend(client, a, 1).raise_for_status()
+        rv = client.post(f"/api/applications/{a}/revoke", json={"reason": "gone"})
+        assert rv.status_code == 200
+        assert rv.json()["was_suspended"] is True
+
+        r3 = self._resume(client, a, 3)
+        assert r3.status_code == 409
+        assert r3.json()["error"]["code"] == "already_revoked"
+
+        r4 = self._suspend(client, a, 3)
+        assert r4.status_code == 409
+        assert r4.json()["error"]["code"] == "already_revoked"
+
+        # revoking twice is still refused with the original code
+        r5 = client.post(f"/api/applications/{a}/revoke", json={})
+        assert r5.status_code == 409
+        assert r5.json()["error"]["code"] == "already_revoked"
+
+    def test_unknown_ids_are_404(self, client):
+        assert self._suspend(client, 999, 0).status_code == 404
+        assert self._resume(client, 999, 0).status_code == 404
+
+    def test_share_revision_arbitration_with_all_other_writers(self, client):
+        a = self._submit(client, "A", freq=(100, 101))
+        b = self._submit(client, "B", freq=(200, 201))
+        c = self._submit(client, "C", freq=(300, 301))
+        self._approve(client, a, 0)  # revision 1
+
+        # suspend based on a stale revision loses
+        stale = self._suspend(client, a, 0)
+        assert stale.status_code == 409
+        assert stale.json()["error"]["code"] == "stale_revision"
+
+        # a fresh suspend takes revision 2
+        ok = self._suspend(client, a, 1)
+        assert ok.status_code == 200 and ok.json()["revision"] == 2
+
+        # an approval based on revision 1 is stale now; retries at 2
+        stale_app = client.post(
+            f"/api/applications/{b}/approve", json={"expected_revision": 1}
+        )
+        assert stale_app.json()["error"]["code"] == "stale_revision"
+        self._approve(client, b, 2)  # revision 3
+
+        # batch approval shares the sequence too (revision 4)
+        batch = client.post(
+            "/api/applications/batch-approve",
+            json={"expected_revision": 3, "application_ids": [c]},
+        )
+        assert batch.status_code == 200
+        assert batch.json()["revision"] == 4
+
+        # a resume based on an old revision loses; retry at 4 -> revision 5
+        stale_resume = self._resume(client, a, 2)
+        assert stale_resume.status_code == 409
+        assert stale_resume.json()["error"]["details"] == {
+            "expected_revision": 2,
+            "current_revision": 4,
+        }
+        ok2 = self._resume(client, a, 4)
+        assert ok2.status_code == 200 and ok2.json()["revision"] == 5
+
+    def test_suspend_resume_history_snapshots(self, client):
+        a = self._submit(client, "A", freq=(100, 110))
+        self._approve(client, a, 0)  # 1
+        self._suspend(client, a, 1, reason="down").raise_for_status()  # 2
+        self._resume(client, a, 2, reason="back").raise_for_status()  # 3
+
+        # revision 1: approved and effective, original approval not rewritten
+        snap1 = client.get("/api/revision/1").json()
+        assert snap1["effective_application_ids"] == [a]
+        assert snap1["suspended_application_ids"] == []
+        (approval,) = snap1["approvals"]
+        assert approval["status_as_of"] == "approved"
+        assert snap1["suspensions"] == [] and snap1["resumptions"] == []
+
+        # revision 2: suspended, marked on the approval record itself
+        snap2 = client.get("/api/revision/2").json()
+        assert snap2["effective_application_ids"] == []
+        assert snap2["suspended_application_ids"] == [a]
+        assert snap2["approvals"][0]["status_as_of"] == "suspended"
+        assert snap2["approvals"][0]["suspended_at_revision"] == 2
+        assert "revoked_at_revision" not in snap2["approvals"][0]
+        assert snap2["suspensions"] == [
+            {
+                "revision": 2,
+                "application_id": a,
+                "reason": "down",
+                "created_at": snap2["suspensions"][0]["created_at"],
+            }
+        ]
+
+        # revision 3: effective again; history at 1/2 is unchanged
+        snap3 = client.get("/api/revision/3").json()
+        assert snap3["effective_application_ids"] == [a]
+        assert snap3["suspended_application_ids"] == []
+        assert snap3["approvals"][0]["status_as_of"] == "approved"
+        assert "suspended_at_revision" not in snap3["approvals"][0]
+        assert snap3["resumptions"][0]["revision"] == 3
+        assert snap3["resumptions"][0]["reason"] == "back"
+        assert snap3["resumptions"][0]["guard_band"] == 2.0
+        # the original approval event was never rewritten
+        assert snap3["approvals"][0]["revision"] == 1
+        assert snap3["approvals"][0]["guard_band"] == 2.0
+
+    def test_multiple_suspend_resume_cycles_replay(self, client):
+        a = self._submit(client, "A", freq=(100, 101))
+        self._approve(client, a, 0)  # 1
+        self._suspend(client, a, 1).raise_for_status()  # 2
+        self._resume(client, a, 2).raise_for_status()  # 3
+        self._suspend(client, a, 3).raise_for_status()  # 4
+
+        # replay shows suspended with the *latest* suspension marker
+        snap4 = client.get("/api/revision/4").json()
+        assert snap4["suspended_application_ids"] == [a]
+        assert snap4["approvals"][0]["suspended_at_revision"] == 4
+        assert [x["revision"] for x in snap4["suspensions"]] == [2, 4]
+        assert [x["revision"] for x in snap4["resumptions"]] == [3]
+
+        # snapshots at intermediate revisions are stable
+        assert (
+            client.get("/api/revision/2").json()["suspended_application_ids"]
+            == [a]
+        )
+        assert client.get("/api/revision/3").json()["effective_application_ids"] == [a]
+
+        # ending with a revocation leaves a terminal as-of state
+        client.post(f"/api/applications/{a}/revoke", json={}).raise_for_status()  # 5
+        snap5 = client.get("/api/revision/5").json()
+        assert snap5["effective_application_ids"] == []
+        assert snap5["suspended_application_ids"] == []
+        assert snap5["approvals"][0]["status_as_of"] == "revoked"
+        assert snap5["approvals"][0]["revoked_at_revision"] == 5
+        assert "suspended_at_revision" not in snap5["approvals"][0]
+
+    def test_rejected_suspend_resume_consume_no_revision(self, client):
+        a = self._submit(client, "A")
+        self._approve(client, a, 0)
+        # every rejection kind below must leave the revision at 1
+        self._suspend(client, a, 5)  # stale
+        self._suspend(client, a, 1).raise_for_status()  # -> revision 2
+        self._suspend(client, a, 2)  # already suspended
+        self._resume(client, a, 9)  # stale
+        p = self._submit(client, "P", freq=(900, 901))
+        self._resume(client, p, 2)  # pending -> not_suspended
+        assert client.get("/api/revision/current").json()["current_revision"] == 2
+        self._resume(client, a, 2).raise_for_status()  # -> revision 3
+        assert client.get("/api/revision/current").json()["current_revision"] == 3
+

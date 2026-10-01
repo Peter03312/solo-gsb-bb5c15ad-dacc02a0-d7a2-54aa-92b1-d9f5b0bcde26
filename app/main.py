@@ -10,9 +10,11 @@ POST   /api/applications/{id}/available-ranges
                                        maximal free lower-bound ranges
 POST   /api/applications/{id}/approve    conditional approval (expected rev.)
 POST   /api/applications/batch-approve   atomic group approval (expected rev.)
+POST   /api/applications/{id}/suspend    temporary outage: leave effective set
+POST   /api/applications/{id}/resume     re-adjudicate and restore the license
 POST   /api/applications/{id}/revoke     revoke (changes future effective set)
 GET    /api/revision/current             current revision + effective set
-GET    /api/revision/{revision}          as-of snapshot (approvals/revocations)
+GET    /api/revision/{revision}          as-of snapshot (all event types)
 GET    /api/config/guard-band            live guard band + current revision
 POST   /api/config/guard-band/preview    dry-run a proposed band (non-mutating)
 POST   /api/config/guard-band            confirm a new band (expected rev.)
@@ -22,21 +24,35 @@ Concurrency
 -----------
 Approval locks the singleton ``revision_meta`` row (``SELECT ... FOR UPDATE``)
 for the duration of the transaction.  Concurrent single approvals, batch
-approvals, revocations and guard-band changes therefore serialise on the
-same revision arbitration: losers re-adjudicate against the winner's commit
-and are refused with ``stale_revision`` or ``interference``.  A batch either
-consumes one consecutive revision per member in input order, or nothing at
-all; a guard-band change consumes exactly one revision.
+approvals, suspensions, resumptions, revocations and guard-band changes
+therefore serialise on the same revision arbitration: losers re-adjudicate
+against the winner's commit and are refused with ``stale_revision`` or
+``interference``.  A batch either consumes one consecutive revision per
+member in input order, or nothing at all; a guard-band change, a suspension
+or a resumption consumes exactly one revision.
+
+Temporary outages
+-----------------
+A suspension immediately removes an approved license from the effective set
+without touching its original approval.  A resumption re-adjudicates the
+license against the live guard band and all currently effective licenses; a
+stale revision or renewed interference is refused (returning the current
+revision or the conflicting licenses) while the license stays suspended and
+no revision is consumed.  A suspended license may also be permanently
+revoked with the ordinary revoke operation; a revoked license can never be
+resumed.  Both operations append immutable events so historical snapshots
+restore the suspended/effective status and the effective set at every
+revision.
 
 Guard band
 ----------
 The live guard band is stored on the ``revision_meta`` row and seeded once
 from the ``GUARD_BAND`` environment variable (restarts never overwrite it).
-Every adjudication (preview, single/batch approval) uses the live value;
-each confirmed change is appended as an immutable ``guard_band_events``
-record so historical revision snapshots restore the band in force at the
-time.  Approval events keep their own copy of the band they were decided
-under and are never rewritten.
+Every adjudication (preview, single/batch approval, resumption) uses the
+live value; each confirmed change is appended as an immutable
+``guard_band_events`` record so historical revision snapshots restore the
+band in force at the time.  Approval and resumption events keep their own
+copy of the band they were decided under and are never rewritten.
 """
 from __future__ import annotations
 
@@ -59,8 +75,10 @@ from .models import (
     Application,
     ApprovalEvent,
     GuardBandEvent,
+    ResumptionEvent,
     RevisionMeta,
     RevocationEvent,
+    SuspensionEvent,
 )
 from .schemas import (
     ApplicationCreate,
@@ -69,7 +87,9 @@ from .schemas import (
     BatchApprovalRequest,
     GuardBandPreviewRequest,
     GuardBandUpdateRequest,
+    ResumptionRequest,
     RevocationRequest,
+    SuspensionRequest,
 )
 from .semantic_validation import (
     validate_application,
@@ -84,6 +104,9 @@ E_VALIDATION = "validation_failed"
 E_NOT_FOUND = "not_found"
 E_NOT_PENDING = "not_pending"
 E_ALREADY_REVOKED = "already_revoked"
+E_NOT_APPROVED = "not_approved"
+E_ALREADY_SUSPENDED = "already_suspended"
+E_NOT_SUSPENDED = "not_suspended"
 E_REVISION_OUT_OF_RANGE = "revision_out_of_range"
 E_STALE_REVISION = "stale_revision"
 E_INTERFERENCE = "interference"
@@ -113,6 +136,7 @@ def serialize_application(app: Application) -> dict[str, Any]:
         "time_window": {"start": iso(app.start_time), "end": iso(app.end_time)},
         "status": app.status,
         "approval_revision": app.approval_revision,
+        "suspended_revision": app.suspended_revision,
         "created_at": iso(app.created_at),
     }
 
@@ -202,7 +226,7 @@ def serialize_group_conflict(
 
 
 def load_effective_licenses(session) -> list[License]:
-    """Approved and not (yet) revoked = the effective set for adjudication."""
+    """Approved and neither suspended nor revoked = the effective set."""
     rows = (
         session.query(Application)
         .filter(Application.status == "approved")
@@ -235,9 +259,13 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
     """Reconstruct the state of the world *at* ``revision``.
 
     Returns every approval event with revision <= the target and the
-    application snapshot, flags those later revoked by the target revision,
-    and includes all revocation events of the period, plus the guard band
-    in force at that revision and the guard-band records behind it.
+    application snapshot, replays the approval/suspension/resumption/
+    revocation timeline of the period to flag each grant's status as of the
+    target revision, and includes all suspension, resumption and revocation
+    events of the period, plus the guard band in force at that revision and
+    the guard-band records behind it.  Original approval events are never
+    rewritten: a resumption is a separate event carrying its own band
+    snapshot.
     """
     approvals = (
         session.query(ApprovalEvent)
@@ -251,31 +279,74 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         .order_by(RevocationEvent.revision)
         .all()
     )
+    suspensions = (
+        session.query(SuspensionEvent)
+        .filter(SuspensionEvent.revision <= revision)
+        .order_by(SuspensionEvent.revision)
+        .all()
+    )
+    resumptions = (
+        session.query(ResumptionEvent)
+        .filter(ResumptionEvent.revision <= revision)
+        .order_by(ResumptionEvent.revision)
+        .all()
+    )
     guard_events = (
         session.query(GuardBandEvent)
         .filter(GuardBandEvent.revision <= revision)
         .order_by(GuardBandEvent.revision)
         .all()
     )
-    revoked_at_or_before = {ev.application_id: ev for ev in revocations}
+
+    # Replay every lifecycle event up to the target revision in revision
+    # order; the last event of each application decides its as-of state.
+    # (revision, kind, application_id, marker_revision); approval precedes
+    # any other event of the same revision because every revision has exactly
+    # one event.
+    lifecycle: list[tuple[int, str, int]] = []
+    lifecycle.extend((ev.revision, "approved", ev.application_id) for ev in approvals)
+    lifecycle.extend(
+        (ev.revision, "suspended", ev.application_id) for ev in suspensions
+    )
+    lifecycle.extend(
+        (ev.revision, "approved", ev.application_id) for ev in resumptions
+    )
+    lifecycle.extend((ev.revision, "revoked", ev.application_id) for ev in revocations)
+    lifecycle.sort(key=lambda item: item[0])
+    # state[app_id] = (state, latest marker revision): marker is the
+    # suspension revision while suspended, the revocation revision once
+    # revoked, and irrelevant while approved.
+    state: dict[int, tuple[str, int]] = {}
+    for rev, kind, app_id in lifecycle:
+        if kind == "suspended":
+            state[app_id] = ("suspended", rev)
+        elif kind == "revoked":
+            state[app_id] = ("revoked", rev)
+        else:
+            state[app_id] = ("approved", rev)
 
     approval_records: list[dict[str, Any]] = []
     effective_ids: list[int] = []
+    suspended_ids: list[int] = []
     for ev in approvals:
         app = session.get(Application, ev.application_id)
-        rev = revoked_at_or_before.get(ev.application_id)
-        was_revoked_by_then = rev is not None and rev.revision <= revision
+        status_as_of, marker = state.get(
+            ev.application_id, ("approved", ev.revision)
+        )
         record = {
             "revision": ev.revision,
             "application_id": ev.application_id,
             "guard_band": ev.guard_band,
             "created_at": iso(ev.created_at),
             # Status of this grant *as of the queried revision*.
-            "status_as_of": "revoked" if was_revoked_by_then else "approved",
+            "status_as_of": status_as_of,
             "application": serialize_application(app) if app else None,
         }
-        if was_revoked_by_then:
-            record["revoked_at_revision"] = rev.revision
+        if status_as_of == "revoked":
+            record["revoked_at_revision"] = marker
+        elif status_as_of == "suspended":
+            record["suspended_at_revision"] = marker
+            suspended_ids.append(ev.application_id)
         else:
             effective_ids.append(ev.application_id)
         approval_records.append(record)
@@ -288,6 +359,25 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
             "created_at": iso(ev.created_at),
         }
         for ev in revocations
+    ]
+    suspension_records = [
+        {
+            "revision": ev.revision,
+            "application_id": ev.application_id,
+            "reason": ev.reason,
+            "created_at": iso(ev.created_at),
+        }
+        for ev in suspensions
+    ]
+    resumption_records = [
+        {
+            "revision": ev.revision,
+            "application_id": ev.application_id,
+            "guard_band": ev.guard_band,
+            "reason": ev.reason,
+            "created_at": iso(ev.created_at),
+        }
+        for ev in resumptions
     ]
 
     return {
@@ -303,7 +393,10 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
             for ev in guard_events
         ],
         "effective_application_ids": effective_ids,
+        "suspended_application_ids": suspended_ids,
         "approvals": approval_records,
+        "suspensions": suspension_records,
+        "resumptions": resumption_records,
         "revocations": revocation_records,
     }
 
@@ -387,12 +480,21 @@ def current_revision() -> dict[str, Any]:
             for app_id in snapshot["effective_application_ids"]
             if (app := session.get(Application, app_id)) is not None
         ]
+        suspended_applications = [
+            serialize_application(app)
+            for app_id in snapshot["suspended_application_ids"]
+            if (app := session.get(Application, app_id)) is not None
+        ]
     return {
         "current_revision": revision,
         "guard_band": guard_band,
         "effective_application_ids": snapshot["effective_application_ids"],
         "effective_applications": effective_applications,
+        "suspended_application_ids": snapshot["suspended_application_ids"],
+        "suspended_applications": suspended_applications,
         "approvals": snapshot["approvals"],
+        "suspensions": snapshot["suspensions"],
+        "resumptions": snapshot["resumptions"],
         "revocations": snapshot["revocations"],
         "guard_band_changes": snapshot["guard_band_changes"],
     }
@@ -455,10 +557,11 @@ def list_applications(status: str | None = None) -> dict[str, Any]:
     with SessionLocal() as session:
         query = session.query(Application).order_by(Application.id)
         if status is not None:
-            if status not in {"pending", "approved", "revoked"}:
+            if status not in {"pending", "approved", "suspended", "revoked"}:
                 raise APIError(
                     E_VALIDATION,
-                    "status filter must be one of pending, approved, revoked",
+                    "status filter must be one of pending, approved, "
+                    "suspended, revoked",
                     status_code=422,
                 )
             query = query.filter(Application.status == status)
@@ -941,6 +1044,12 @@ def batch_approve_applications(payload: BatchApprovalRequest) -> dict[str, Any]:
 def revoke_application(
     application_id: int, payload: RevocationRequest
 ) -> dict[str, Any]:
+    """Permanently revoke a license.
+
+    Works on both effective licenses and licenses temporarily suspended for
+    an equipment outage; a revoked license can never be resumed.  Only the
+    effective set used by later adjudications changes; history is kept.
+    """
     with SessionLocal() as session:
         try:
             with session.begin():
@@ -959,15 +1068,16 @@ def revoke_application(
                         f"application {application_id} is already revoked",
                         status_code=409,
                     )
-                if row.status != "approved":
+                if row.status not in ("approved", "suspended"):
                     raise APIError(
                         E_NOT_PENDING,
-                        f"application {application_id} is pending and cannot "
-                        "be revoked",
+                        f"application {application_id} is {row.status} and "
+                        "cannot be revoked",
                         status_code=409,
                         details={"status": row.status},
                     )
 
+                was_suspended = row.status == "suspended"
                 meta.revision += 1
                 session.add(
                     RevocationEvent(
@@ -983,6 +1093,7 @@ def revoke_application(
                     "application_id": application_id,
                     "revision": meta.revision,
                     "previous_approval_revision": row.approval_revision,
+                    "was_suspended": was_suspended,
                     "reason": payload.reason,
                 }
         except IntegrityError:
@@ -991,6 +1102,226 @@ def revoke_application(
             raise APIError(
                 E_STALE_REVISION,
                 f"the revision advanced concurrently (now {latest}); retry",
+                status_code=409,
+                details={"current_revision": latest},
+            )
+    return response
+
+
+# --------------------------------------------------------------------------- #
+# Suspend / resume (temporary equipment outage, revision-arbitrated)
+# --------------------------------------------------------------------------- #
+@app.post("/api/applications/{application_id}/suspend", tags=["applications"])
+def suspend_application(
+    application_id: int, payload: SuspensionRequest
+) -> dict[str, Any]:
+    """Temporarily take an approved license out of the effective set.
+
+    The original approval is kept and no re-application is needed; the
+    license immediately stops participating in later adjudications.  Shares
+    the singleton revision lock with every other writer: a stale expected
+    revision returns the current revision and consumes nothing.  Pending
+    applications must be approved first; a suspended application must not
+    be suspended again; revoked licenses are terminal.
+    """
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                # Same singleton lock as approve/batch/revoke/guard-band
+                # change: all writers share one revision arbitration.
+                meta = session.get(RevisionMeta, 1, with_for_update=True)
+                current = meta.revision
+
+                row = session.get(Application, application_id)
+                if row is None:
+                    raise APIError(
+                        E_NOT_FOUND,
+                        f"application {application_id} does not exist",
+                        status_code=404,
+                    )
+                if row.status == "revoked":
+                    raise APIError(
+                        E_ALREADY_REVOKED,
+                        f"application {application_id} has been revoked and "
+                        "cannot be suspended",
+                        status_code=409,
+                    )
+                if row.status == "suspended":
+                    raise APIError(
+                        E_ALREADY_SUSPENDED,
+                        f"application {application_id} is already suspended "
+                        f"since revision {row.suspended_revision}",
+                        status_code=409,
+                        details={
+                            "suspended_at_revision": row.suspended_revision
+                        },
+                    )
+                if row.status != "approved":
+                    raise APIError(
+                        E_NOT_APPROVED,
+                        f"application {application_id} is {row.status}; only "
+                        "approved licenses can be suspended",
+                        status_code=409,
+                        details={"status": row.status},
+                    )
+
+                if payload.expected_revision != current:
+                    raise APIError(
+                        E_STALE_REVISION,
+                        f"expected revision {payload.expected_revision} but "
+                        f"current revision is {current}; re-decide; the "
+                        "license was not suspended",
+                        status_code=409,
+                        details={
+                            "expected_revision": payload.expected_revision,
+                            "current_revision": current,
+                        },
+                    )
+
+                meta.revision = current + 1
+                session.add(
+                    SuspensionEvent(
+                        revision=meta.revision,
+                        application_id=application_id,
+                        reason=payload.reason,
+                    )
+                )
+                row.status = "suspended"
+                row.suspended_revision = meta.revision
+                session.flush()
+                response = {
+                    "suspended": True,
+                    "application_id": application_id,
+                    "revision": meta.revision,
+                    "previous_approval_revision": row.approval_revision,
+                    "reason": payload.reason,
+                    "application": serialize_application(row),
+                }
+        except IntegrityError:
+            # Backends without row locks (SQLite in tests): a concurrent
+            # writer took the revision slot; nothing was changed.
+            session.rollback()
+            latest = session.get(RevisionMeta, 1).revision
+            raise APIError(
+                E_STALE_REVISION,
+                f"the revision advanced concurrently (now {latest}); "
+                "re-decide; the license was not suspended",
+                status_code=409,
+                details={"current_revision": latest},
+            )
+    return response
+
+
+@app.post("/api/applications/{application_id}/resume", tags=["applications"])
+def resume_application(
+    application_id: int, payload: ResumptionRequest
+) -> dict[str, Any]:
+    """Restore a suspended license after re-adjudication.
+
+    The license is re-checked under the revision lock against the live guard
+    band and every currently effective license.  A stale expected revision
+    returns the current revision and a renewed interference returns the
+    conflicting licenses; in both cases the license stays suspended and no
+    revision is consumed.  A successful resume consumes exactly one
+    revision; the original approval event is left untouched.
+    """
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                # Same singleton lock as every other writer.
+                meta = session.get(RevisionMeta, 1, with_for_update=True)
+                current = meta.revision
+                guard_band = meta.guard_band
+
+                row = session.get(Application, application_id)
+                if row is None:
+                    raise APIError(
+                        E_NOT_FOUND,
+                        f"application {application_id} does not exist",
+                        status_code=404,
+                    )
+                if row.status == "revoked":
+                    raise APIError(
+                        E_ALREADY_REVOKED,
+                        f"application {application_id} has been revoked and "
+                        "cannot be resumed",
+                        status_code=409,
+                    )
+                if row.status != "suspended":
+                    raise APIError(
+                        E_NOT_SUSPENDED,
+                        f"application {application_id} is {row.status}; only "
+                        "suspended licenses can be resumed",
+                        status_code=409,
+                        details={"status": row.status},
+                    )
+
+                if payload.expected_revision != current:
+                    raise APIError(
+                        E_STALE_REVISION,
+                        f"expected revision {payload.expected_revision} but "
+                        f"current revision is {current}; re-decide; the "
+                        "license stays suspended",
+                        status_code=409,
+                        details={
+                            "expected_revision": payload.expected_revision,
+                            "current_revision": current,
+                        },
+                    )
+
+                # Re-adjudicate under the lock against the latest effective
+                # set and the live guard band.  The resuming license itself
+                # is still suspended, so it is not part of that set.
+                effective = load_effective_licenses(session)
+                conflicts = adjudication.evaluate(
+                    to_license(row), effective, guard_band
+                )
+                if conflicts:
+                    raise APIError(
+                        E_INTERFERENCE,
+                        f"application {application_id} would interfere with "
+                        f"{len(conflicts)} effective grant(s); the license "
+                        "stays suspended and no revision was consumed",
+                        status_code=409,
+                        details={
+                            "current_revision": current,
+                            "conflicts": [
+                                serialize_conflict(c, guard_band)
+                                for c in conflicts
+                            ],
+                        },
+                    )
+
+                meta.revision = current + 1
+                session.add(
+                    ResumptionEvent(
+                        revision=meta.revision,
+                        application_id=application_id,
+                        guard_band=guard_band,
+                        reason=payload.reason,
+                    )
+                )
+                row.status = "approved"
+                row.suspended_revision = None
+                session.flush()
+                response = {
+                    "resumed": True,
+                    "application_id": application_id,
+                    "revision": meta.revision,
+                    "original_approval_revision": row.approval_revision,
+                    "guard_band": guard_band,
+                    "reason": payload.reason,
+                    "application": serialize_application(row),
+                }
+        except IntegrityError:
+            # Backends without row locks (SQLite in tests): a concurrent
+            # writer took the revision slot; the license stays suspended.
+            session.rollback()
+            latest = session.get(RevisionMeta, 1).revision
+            raise APIError(
+                E_STALE_REVISION,
+                f"the revision advanced concurrently (now {latest}); "
+                "re-decide; the license stays suspended",
                 status_code=409,
                 details={"current_revision": latest},
             )

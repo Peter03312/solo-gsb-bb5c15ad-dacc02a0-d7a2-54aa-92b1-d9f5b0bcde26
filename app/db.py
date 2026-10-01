@@ -52,6 +52,23 @@ def _ensure_guard_band_column() -> None:
         )
 
 
+def _ensure_suspended_revision_column() -> None:
+    """Add ``applications.suspended_revision`` to older databases.
+
+    Mirrors :func:`_ensure_guard_band_column`: ``create_all`` only creates
+    missing tables, so the nullable column marking a temporary outage is
+    added idempotently; existing rows simply start as NULL (not suspended).
+    """
+    inspector = inspect(engine)
+    columns = {col["name"] for col in inspector.get_columns("applications")}
+    if "suspended_revision" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text("ALTER TABLE applications ADD COLUMN suspended_revision INTEGER")
+        )
+
+
 def init_db() -> None:
     """Create tables and seed the singleton revision row (revision 0).
 
@@ -66,6 +83,7 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     _ensure_guard_band_column()
+    _ensure_suspended_revision_column()
     with SessionLocal() as session, session.begin():
         meta = session.get(RevisionMeta, 1)
         if meta is None:
