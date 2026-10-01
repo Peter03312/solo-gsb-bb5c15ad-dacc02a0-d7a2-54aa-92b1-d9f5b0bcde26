@@ -155,3 +155,52 @@ post "/api/applications/$F_ID/available-ranges" \
 post "/api/applications/999999/available-ranges" \
   '{"candidate_low_min":180,"candidate_low_max":430}' | J || true
 curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision is still", d["current_revision"])'
+
+echo "== 26. temporary outage: suspend device D (expected revision 7 -> revision 8) =="
+echo "    D leaves the effective set immediately; its approval event is never rewritten."
+post "/api/applications/$D_ID/suspend" \
+  '{"expected_revision":7,"reason":"device powered off for repair"}' | J
+curl -s "$BASE/api/applications?status=suspended" | python3 -c 'import json,sys; print("suspended ids:", [a["id"] for a in json.load(sys.stdin)["applications"]])'
+
+echo "== 27. illegal/duplicate suspend operations are refused (no revision consumed) =="
+echo "    -- suspend D twice (already suspended):"
+post "/api/applications/$D_ID/suspend" '{"expected_revision":8}' | J || true
+echo "    -- approve a suspended grant (use /resume instead):"
+post "/api/applications/$D_ID/approve" '{"expected_revision":8}' | J || true
+echo "    -- suspend a pending application:"
+post "/api/applications/$F_ID/suspend" '{"expected_revision":8}' | J || true
+echo "    -- suspend an unknown id:"
+post "/api/applications/999999/suspend" '{"expected_revision":8}' | J || true
+echo "    -- stale expected revision on the still-active C (state is legal, revision 0 is old):"
+post "/api/applications/$C_ID/suspend" '{"expected_revision":0}' | J || true
+
+echo "== 28. while D is suspended, a device on D's own band [300,310] can be approved =="
+I=$(mk "Device I" 300 310); I_ID=$(echo "$I" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post "/api/applications/$I_ID/approve" '{"expected_revision":8}' | J
+
+echo "== 29. resuming D is re-adjudicated: clashes with I -> stays suspended, revision 9 unchanged =="
+post "/api/applications/$D_ID/resume" '{"expected_revision":9}' | J || true
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision =", d["current_revision"], "| suspension revisions:", [a["revision"] for a in d["suspensions"]], "| resumptions:", d["resumptions"])'
+
+echo "== 30. a stale resume returns the current revision and keeps the grant suspended =="
+post "/api/applications/$D_ID/resume" '{"expected_revision":7}' | J || true
+
+echo "== 31. revoke I permanently (revision 10), then resume D at revision 10 -> revision 11 =="
+post "/api/applications/$I_ID/revoke" '{"reason":"event cancelled"}' | J
+post "/api/applications/$D_ID/resume" \
+  '{"expected_revision":10,"reason":"repair finished"}' | J
+echo "    D is effective again:"
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("effective ids:", d["effective_application_ids"])'
+
+echo "== 32. suspend D once more, then revoke it WHILE suspended: revocation is permanent =="
+post "/api/applications/$D_ID/suspend" \
+  '{"expected_revision":11,"reason":"outage again"}' | J
+post "/api/applications/$D_ID/revoke" '{"reason":"decommissioned"}' | J
+echo "    -- resuming or suspending the revoked grant is now refused:"
+post "/api/applications/$D_ID/resume" '{"expected_revision":13}' | J || true
+post "/api/applications/$D_ID/suspend" '{"expected_revision":13}' | J || true
+
+echo "== 33. history restores suspend/resume/revoke records and each revision's effective set =="
+curl -s "$BASE/api/revision/8" | D_ID="$D_ID" python3 -c 'import json,sys,os; d=json.load(sys.stdin); did=int(os.environ["D_ID"]); print("rev 8: effective", d["effective_application_ids"], "| D status_as_of:", [a["status_as_of"] for a in d["approvals"] if a["application_id"]==did])'
+curl -s "$BASE/api/revision/11" | D_ID="$D_ID" python3 -c 'import json,sys,os; d=json.load(sys.stdin); did=int(os.environ["D_ID"]); print("rev 11: effective", d["effective_application_ids"], "| D status_as_of:", [a["status_as_of"] for a in d["approvals"] if a["application_id"]==did])'
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current", d["current_revision"], "| suspensions:", [(e["revision"], e["application_id"]) for e in d["suspensions"]], "| resumptions:", [(e["revision"], e["application_id"]) for e in d["resumptions"]], "| revocations:", [(e["revision"], e["application_id"]) for e in d["revocations"]])'

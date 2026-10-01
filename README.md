@@ -15,15 +15,23 @@
   UTC 时段与原频段宽度固定（允许单频点），按当前修订快照的有效许可与生效保护带宽
   裁决，返回全部极大的可用连续范围并标明两端是否可取；查询不改任何状态，结果与
   单笔预览在任一可取下界上的干扰结论一致
-- 撤销只改变后续裁决所用的**有效集合**；按修订号查询可还原当时全部批准、撤销记录
-  （整组中的每个修订号都可单独还原截至该项获批时的有效集合）
+- 撤销只改变后续裁决所用的**有效集合**（暂停/恢复同理）；按修订号查询可还原当时
+  全部批准、撤销、暂停、恢复记录（整组中的每个修订号都可单独还原截至该项获批时的有效集合）
 - **保护带宽在线调整**：`GUARD_BAND` 环境变量仅作全新数据库的初值；之后通过
   `POST /api/config/guard-band` 在线变更——先预览（新带宽下当前全部有效许可之间的
   干扰许可对，不改状态），再携同一拟定值与预期修订号确认。确认与单笔/整组批准、
-  撤销**共用同一修订号裁决**；修订号过期或拟定值使任意有效许可对互扰即拒绝
+  撤销、暂停、恢复**共用同一修订号裁决**；修订号过期或拟定值使任意有效许可对互扰即拒绝
   （带宽、有效集合、修订号均不变）；通过只产生**一个**修订号，后续预览与批准统一
   使用新带宽。历史修订查询可还原当时带宽与有效集合，已有批准记录保存的裁决带宽
   不被追改，重启不覆盖已生效设置
+- **临时停机暂停 / 故障解除恢复**：活动设备临时停机时，可按申请 ID
+  **暂停**已获批且未撤销的许可（立即退出有效集合，原批准事件不追改），故障解除后
+  **恢复原许可，无需重提申请**。暂停与恢复都携带预期修订号，与批准、撤销、带宽变更
+  共用同一修订号裁决：恢复时按**当前保护带宽与全部有效许可**重新裁决，互扰则返回
+  冲突对象并**保持暂停**；修订号过期则返回当前修订号并保持原状态——两种拒绝都
+  **不占修订号**，成功各占一个修订号。暂停期间仍可用现有撤销操作**永久撤销**，
+  撤销后不能恢复；未知 ID、非法状态、重复操作均明确拒绝。历史修订查询还原暂停、
+  恢复、撤销记录及各修订的有效集合
 
 ---
 
@@ -70,7 +78,7 @@ export GUARD_BAND="2.0"
 uvicorn app.main:app --reload
 ```
 
-运行测试（自动使用临时 SQLite 库，共 83 个用例）：
+运行测试（自动使用临时 SQLite 库，共 108 个用例）：
 
 ```bash
 pip install -r requirements-dev.txt
@@ -129,7 +137,8 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
    - `within_guard_band`：频段不相交，但**最短间隔 < 保护带宽**
      （间隔**恰好等于**保护带宽时允许，即“严格小于”）。
 
-裁决只考虑**有效集合**：已批准且未被撤销的申请。待审批、已撤销均不参与。
+裁决只考虑**有效集合**：已批准、未撤销且当前未被暂停的申请。待审批、已暂停、
+已撤销均不参与。
 
 ### 可用调频位置查询（不改状态）
 
@@ -150,18 +159,58 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 申请（409）、非有限或倒置的候选区间（422，明细码 `value_not_finite` /
 `candidate_low_min_above_max`）均明确拒绝。
 
+### 临时停机暂停与故障解除恢复
+
+设备临时停机时，运营人员可暂停已获批且未撤销的许可，故障解除后直接恢复，
+**无需重新提交申请**。原批准事件始终保留、**不被追改**；暂停只是把许可移出后续
+裁决使用的有效集合。许可生命周期为
+`待审批 pending → 已批准 approved ⇄ 已暂停 suspended → 已撤销 revoked`
+（`revoked` 为终态）。
+
+- **暂停** `POST /api/applications/{id}/suspend`，请求体
+  `{"expected_revision": n, "reason": "可选原因"}`。许可必须为 `approved`；
+  成功后立即退出有效集合，占用**一个**新修订号，返回状态与修订号。
+- **恢复** `POST /api/applications/{id}/resume`，请求体同上。许可必须为
+  `suspended`；在修订号锁内按**当前生效保护带宽与全部有效许可**对原许可
+  重新裁决：
+  - 通过 → 回到有效集合，占用**一个**新修订号（后续预览/批准/查询重新将其计入）；
+  - 修订号过期 → **409 `stale_revision`**（响应体给当前修订号），**保持暂停**、
+    不占修订号；
+  - 与当前有效许可互扰 → **409 `interference`**（响应体附冲突对象与触发条件，
+    结构同单笔批准），**保持暂停**、不占修订号；冲突解除（如对方被撤销或带宽
+    放宽）后可用新修订号重试。
+- **暂停期间可永久撤销**：仍用现有 `POST .../revoke`（不携修订号，与此前行为
+  一致；响应新增 `previous_status: "suspended"`）。撤销后状态为 `revoked`，
+  **不能再恢复或暂停**。
+- **明确拒绝**：未知 ID（404）；对 `pending` 暂停（409 `not_pending`）；
+  重复暂停（409 `already_suspended`）；暂停/恢复已撤销许可
+  （409 `already_revoked`）；恢复未暂停的许可（409 `not_suspended`，含
+  `pending` 与活动的 `approved`）；对已暂停许可再次批准
+  （409 `already_suspended`，恢复请走 `/resume`）；整组批准混入已暂停成员
+  （409 `not_pending`，明细给出每项状态）。
+- 暂停、成功的恢复与单笔/整组批准、撤销、带宽变更共用**同一把修订号锁与
+  同一条修订号序列**。单笔及整组批准、预览、可用调频查询、带宽预览与确认在
+  裁决时都以**当时有效集合**为准（暂停中的许可不参与）。
+- 历史查询 `GET /api/revision/{n}` 与 `/api/revision/current` 还原当时的
+  暂停记录（`suspensions`）、恢复记录（`resumptions`，含恢复时裁决带宽快照）、
+  撤销记录及**截至该修订的有效集合**；批准记录以 `status_as_of`
+  （`approved` / `suspended` / `revoked`）标明该许可在当时的状态，并附
+  `suspended_at_revision` / `revoked_at_revision`。
+
 ### 修订号与并发模型
 
-- 初始修订号为 **0**；每次批准、**整组批准中的每项**批准、撤销或**保护带宽变更**
-  都使修订号 +1，并追加一条不可变事件。
+- 初始修订号为 **0**；每次批准、**整组批准中的每项**批准、撤销、**暂停、成功的
+  恢复**或**保护带宽变更**都使修订号 +1，并追加一条不可变事件。暂停/恢复被拒
+  （修订过期或恢复互扰）不占用修订号。
 - `POST .../preview` 返回 `current_revision`、冲突对象及每个触发条件。
 - `POST .../approve` 必须携带 `expected_revision`。服务在 PostgreSQL
-  单行修订号表上 `SELECT ... FOR UPDATE` 串行化所有批准/撤销/带宽变更事务：
+  单行修订号表上 `SELECT ... FOR UPDATE` 串行化所有批准/撤销/暂停/恢复/带宽变更事务：
   - `expected_revision != 当前修订号` → **409 `stale_revision`**（修订过期/被并发抢先）；
   - 号对但锁内**重新裁决**发现冲突 → **409 `interference`**（不得占用频段，响应体附冲突）；
   - 通过 → 写入批准事件，占用新修订号。
-- `POST /api/applications/batch-approve` 为**整组原子批准**，与单笔批准/撤销共用
-  同一把修订号锁：
+  暂停/恢复使用同一把锁与同样的拒绝语义；恢复的“锁内重新裁决”失败时许可保持暂停。
+- `POST /api/applications/batch-approve` 为**整组原子批准**，与单笔批准/撤销/暂停/
+  恢复共用同一把修订号锁：
   - 请求体 `{"expected_revision": n, "application_ids": [..]}`，列表必须**非空且无重复**
     （空列表 422；重复返回 `duplicate_application_id`）；
   - 同一事务内按固定顺序核对：**ID 是否存在 → 状态是否仍为待审批 → 修订号是否过期 →
@@ -172,11 +221,15 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
   - 全部通过时**按输入顺序**为每项写一条批准事件，占用连续修订号
     `n+1, n+2, …`，整组**一次提交**；按其中任一修订号查询 `/api/revision/{k}`，
     即还原截至该项获批时的有效集合。
-- 并发单笔批准、整组批准、撤销或带宽变更在同一锁（SQLite 退化为唯一修订号约束兜底）
-  上裁决，胜者提交、其余返回 `stale_revision`，**不会产生部分获批或互相干扰的有效许可**。
-- `POST .../revoke` 只把申请移出有效集合（产生新修订号），历史不删除。
-- `GET /api/revision/{n}` 还原修订号 **n 当时**的批准与撤销记录、**当时生效的保护
-  带宽**及带宽变更记录（`n` 超过当前修订号返回 404）。
+- 并发单笔批准、整组批准、撤销、暂停、恢复或带宽变更在同一锁（SQLite 退化为唯一
+  修订号约束兜底）上裁决，胜者提交、其余返回 `stale_revision`，**不会产生部分获批或
+  互相干扰的有效许可**；恢复裁决失败时许可保持暂停。
+- `POST .../revoke` 只把申请移出有效集合（产生新修订号），历史不删除；
+  对 `approved` 与 `suspended` 许可均可撤销，撤销为终态。
+- `POST .../suspend` / `POST .../resume` 的语义见上文[“临时停机暂停与故障解除
+  恢复”](#临时停机暂停与故障解除恢复)：成功各占一个修订号，被拒不占。
+- `GET /api/revision/{n}` 还原修订号 **n 当时**的批准、撤销、**暂停、恢复**记录、
+  **当时生效的保护带宽**及带宽变更记录（`n` 超过当前修订号返回 404）。
 
 ### 保护带宽的在线调整
 
@@ -189,7 +242,7 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
    会互扰的许可对（含每项触发条件）。预览**不改变任何状态**。
 2. **确认** `POST /api/config/guard-band`，请求体
    `{"guard_band": 同一拟定值, "expected_revision": 预览拿到的修订号}`。
-   与单笔/整组批准、撤销**共用同一把修订号锁**：
+   与单笔/整组批准、撤销、暂停、恢复**共用同一把修订号锁**：
    - 修订号过期 → **409 `stale_revision`**；
    - 拟定值使任意有效许可对互扰 → **409 `interference`**（响应体附许可对与触发
      条件）；两种拒绝下**带宽、有效集合、修订号均不变**；
@@ -215,9 +268,11 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | `POST` | `/api/applications/{id}/available-ranges` | **可用调频位置查询**（候选下界区间内全部极大可用连续范围；不改状态） |
 | `POST` | `/api/applications/{id}/approve` | 携带修订号批准（锁内重新裁决） |
 | `POST` | `/api/applications/batch-approve` | **整组原子批准**（预期修订号 + 非空无重复 ID 列表） |
-| `POST` | `/api/applications/{id}/revoke` | 撤销（仅影响后续有效集合） |
-| `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 全部事件 |
-| `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录与当时带宽 |
+| `POST` | `/api/applications/{id}/revoke` | 撤销（仅影响后续有效集合；活动中或暂停中的许可均可撤销） |
+| `POST` | `/api/applications/{id}/suspend` | **临时暂停**（预期修订号；许可立即退出有效集合，原批准不追改） |
+| `POST` | `/api/applications/{id}/resume` | **故障解除恢复**（预期修订号；按当前带宽与全部有效许可重新裁决） |
+| `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 全部事件（含暂停/恢复） |
+| `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销/暂停/恢复记录与当时带宽 |
 | `GET` | `/api/config/guard-band` | 当前生效带宽、初始带宽与当前修订号 |
 | `POST` | `/api/config/guard-band/preview` | 拟定带宽预览（新带宽下有效许可间的干扰对；不改状态） |
 | `POST` | `/api/config/guard-band` | 确认新带宽（拟定值 + 预期修订号；共享修订号裁决） |
@@ -234,10 +289,12 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组列表为空或含重复 ID 时同样 422，明细码为 `duplicate_application_id`；拟定带宽非有限数（`value_not_finite`）或为负（`guard_band_negative`）；候选下界区间非有限（`value_not_finite`）或倒置（`candidate_low_min_above_max`） |
 | 404 | `not_found` | 申请不存在（整组时 `details.missing_application_ids` 列出全部无效 ID） |
 | 404 | `revision_out_of_range` | 查询了未来修订号 |
-| 409 | `not_pending` | 批准已处理申请 / 撤销待审批申请 / 对非待审批申请查询可用位置（整组时 `details.applications` 列出每项状态） |
-| 409 | `already_revoked` | 重复撤销（整组中混入已撤销申请时同样返回，明细同 `not_pending` 结构） |
-| 409 | `stale_revision` | 修订号过期或被并发批准抢占（单笔/整组/撤销/带宽变更共享裁决） |
-| 409 | `interference` | 重新裁决发现干扰，频段未占用（整组时 `details.applications[].conflicts` 用 `scope` 区分 `effective`/`group`）；或拟定带宽会使当前有效许可对互扰，带宽未变更（`details.interfering_pairs` 附许可对与触发条件） |
+| 409 | `not_pending` | 批准已处理申请 / 撤销待审批申请 / 暂停非已批准（`pending`）申请 / 对非待审批申请查询可用位置（整组时 `details.applications` 列出每项状态；整组混入已暂停成员同样用此码，状态为 `suspended`） |
+| 409 | `already_revoked` | 重复撤销，或暂停/恢复一个已撤销许可（整组中混入已撤销申请时同样返回，明细同 `not_pending` 结构） |
+| 409 | `already_suspended` | 重复暂停已暂停许可，或对已暂停许可再次批准（恢复请走 `/resume`） |
+| 409 | `not_suspended` | 对未暂停的许可（`pending` 或活动的 `approved`）调用恢复 |
+| 409 | `stale_revision` | 修订号过期或被并发批准/撤销/暂停/恢复/带宽变更抢占（单笔/整组/暂停/恢复/带宽变更共享裁决） |
+| 409 | `interference` | 重新裁决发现干扰，频段未占用（整组时 `details.applications[].conflicts` 用 `scope` 区分 `effective`/`group`）；或拟定带宽会使当前有效许可对互扰，带宽未变更（`details.interfering_pairs` 附许可对与触发条件）；或恢复许可时与当前有效许可互扰，许可**保持暂停**（`details.conflicts` 附冲突对象与触发条件） |
 
 ---
 
@@ -635,6 +692,108 @@ curl -i -X POST http://localhost:8000/api/applications/2/available-ranges \
 #                "code": "candidate_low_min_above_max", ...}]}}
 ```
 
+### 6.16 设备临时停机：暂停 → 停机期间裁决变化 → 恢复（或保持暂停）
+
+保护带宽 **2 MHz**。先有许可 A `[100,110]`（修订号 1）。设备 A 临时停机，
+运营人员暂停它（占修订号 2；原批准事件不追改，立即退出有效集合）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/1/suspend \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 1, "reason": "设备停机检修"}'
+```
+
+```json
+{"suspended": true, "application_id": 1, "revision": 2, "guard_band": 2.0,
+ "previous_approval_revision": 1, "reason": "设备停机检修",
+ "application": {"id": 1, "status": "suspended", "approval_revision": 1, ...}}
+```
+
+暂停期间 A 不参与任何裁决——原本与 A 互扰的申请 B 此刻可以预览无冲突并获批
+（占修订号 3）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/2/preview
+# {"current_revision": 2, "has_conflicts": false, ...}   # A 已不在有效集合
+curl -s -X POST http://localhost:8000/api/applications/2/approve \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 2}'
+# {"approved": true, "revision": 3, ...}
+```
+
+故障解除，尝试恢复 A：服务在锁内按**当前带宽与全部有效许可**重新裁决，发现
+A 与新获批的 B 互扰 → **409 `interference`**，响应附冲突对象，**A 保持暂停、
+不占修订号**：
+
+```bash
+curl -i -X POST http://localhost:8000/api/applications/1/resume \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 3}'
+```
+
+```json
+HTTP/1.1 409 Conflict
+{"error": {"code": "interference",
+  "message": "application 1 would interfere with 1 effective grant(s); the grant stays suspended and no revision was consumed",
+  "details": {"current_revision": 3,
+    "conflicts": [{"application": {"id": 2, ...},
+                   "trigger": {...}, "reason": "frequency_intersection"}]}}}
+```
+
+携带过期修订号恢复（或暂停）→ **409 `stale_revision`**，响应给当前修订号，
+同样不改状态、不占修订号：
+
+```bash
+curl -i -X POST http://localhost:8000/api/applications/1/resume \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 0}'
+# HTTP/1.1 409 {"error": {"code": "stale_revision",
+#   "details": {"expected_revision": 0, "current_revision": 3}}}
+```
+
+冲突解除（B 被撤销，修订号 4）后，用新修订号恢复 A → 成功，占修订号 5，
+A 回到有效集合（**无需重提申请**）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/2/revoke \
+  -H 'Content-Type: application/json' -d '{"reason": "活动取消"}'
+# {"revoked": true, "revision": 4, ...}
+curl -s -X POST http://localhost:8000/api/applications/1/resume \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 4}'
+# {"resumed": true, "application_id": 1, "revision": 5, "guard_band": 2.0,
+#  "previous_approval_revision": 1,
+#  "application": {"id": 1, "status": "approved", ...}}
+```
+
+暂停期间也可沿用现有撤销操作**永久撤销**（响应中的 `previous_status` 标明撤销
+前是 `approved` 还是 `suspended`），撤销后恢复/暂停/再撤销都被拒绝：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/1/suspend \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 5}'
+# {"suspended": true, "revision": 6, ...}
+curl -s -X POST http://localhost:8000/api/applications/1/revoke \
+  -H 'Content-Type: application/json' -d '{"reason": "设备报废"}'
+# {"revoked": true, "revision": 7, "previous_status": "suspended", ...}
+```
+
+其余明确拒绝：未知 ID（404 `not_found`）；重复暂停 / 批准已暂停许可
+（409 `already_suspended`）；暂停待审批申请（409 `not_pending`）；恢复未暂停
+许可（409 `not_suspended`）；暂停或恢复已撤销许可（409 `already_revoked`）；
+整组批准混入已暂停成员（409 `not_pending`，明细状态为 `suspended`）。
+历史查询还原暂停/恢复链与各修订有效集合：
+
+```bash
+curl -s http://localhost:8000/api/revision/2
+# {"revision": 2, "effective_application_ids": [],
+#  "suspensions": [{"revision": 2, "application_id": 1, "reason": "设备停机检修"}],
+#  "resumptions": [],
+#  "approvals": [{"revision": 1, ..., "status_as_of": "suspended",
+#                 "suspended_at_revision": 2}], ...}
+curl -s http://localhost:8000/api/revision/current
+# {"current_revision": 7, ...,
+#  "suspensions": [{"revision": 2, ...}, {"revision": 6, ...}],
+#  "resumptions": [{"revision": 5, ..., "guard_band": 2.0}],
+#  "revocations": [..., {"revision": 7, "application_id": 1, ...}]}
+```
+
 脚本版走查：[`examples/walkthrough.sh`](examples/walkthrough.sh)
 （`./examples/walkthrough.sh http://localhost:8000`）。
 
@@ -645,11 +804,11 @@ curl -i -X POST http://localhost:8000/api/applications/2/available-ranges \
 ```
 .
 ├── app/
-│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准、带宽在线配置与可用位置查询）
+│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准、带宽在线配置、可用位置查询与暂停/恢复）
 │   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决（含组内两两、有效集成对检查与可用下界区间求解）
 │   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验（含拟定带宽与候选下界区间校验）
-│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、GuardBand*Request、AvailableRangesRequest）
-│   ├── models.py               # SQLAlchemy 表（申请 + 批准/撤销/带宽事件 + 修订号/当前带宽）
+│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、GuardBand*Request、AvailableRangesRequest、Suspension/ResumptionRequest）
+│   ├── models.py               # SQLAlchemy 表（申请 + 批准/撤销/暂停/恢复/带宽事件 + 修订号/当前带宽）
 │   ├── db.py                   # 引擎、等待数据库、建表、修订号与带宽初值初始化（重启不覆盖）
 │   ├── config.py               # 环境变量配置（GUARD_BAND 仅作建库初值）
 │   └── errors.py               # 统一错误信封

@@ -2,22 +2,28 @@
 
 History is event-sourced:
 
-* ``applications``      - every submitted request, rejected submissions are
-                          never persisted (see whole-request validation);
-* ``approval_events``   - append-only approval record, one per revision;
-* ``revocation_events`` - append-only revocation record, one per revision;
-* ``guard_band_events`` - append-only guard-band record, one per revision
-                          (revision 0 is the initial value seeded at database
-                          creation, every later row is one confirmed online
-                          change);
-* ``revision_meta``     - singleton row holding the current revision number
-                          and the guard band currently in force.
+* ``applications``        - every submitted request, rejected submissions are
+                            never persisted (see whole-request validation);
+* ``approval_events``     - append-only approval record, one per revision;
+* ``revocation_events``   - append-only revocation record, one per revision;
+* ``suspension_events``   - append-only suspension record (temporary device
+                            outage), one per revision;
+* ``resumption_events``   - append-only resumption record, one per revision;
+* ``guard_band_events``   - append-only guard-band record, one per revision
+                            (revision 0 is the initial value seeded at database
+                            creation, every later row is one confirmed online
+                            change);
+* ``revision_meta``       - singleton row holding the current revision number
+                            and the guard band currently in force.
 
 A revocation never deletes history: it only removes an application from the
-effective set used by later adjudications.  Snapshots for any past revision
-are reconstructed from the event tables, including the guard band in force
-at that revision.  Approval events keep their own immutable copy of the
-band they were decided under and are never rewritten.
+effective set used by later adjudications.  Suspension is temporary and
+reversible: a suspension event removes the grant from the effective set and a
+later resumption event (re-adjudicated under the guard band then in force)
+restores it; a suspended grant may also be revoked, permanently.  Snapshots
+for any past revision are reconstructed from the event tables, including the
+guard band in force at that revision.  Approval events keep their own
+immutable copy of the band they were decided under and are never rewritten.
 """
 from __future__ import annotations
 
@@ -66,7 +72,8 @@ class Application(Base):
         DateTime(timezone=True), nullable=False
     )
 
-    # pending -> approved -> revoked (irreversible transitions)
+    # pending -> approved -> (suspended <-> approved) -> revoked
+    # (revoked is terminal; suspended grants may be revoked permanently)
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="pending", server_default="pending"
     )
@@ -107,6 +114,56 @@ class RevocationEvent(Base):
     )
 
     __table_args__ = (Index("ix_revocation_events_application", "application_id"),)
+
+
+class SuspensionEvent(Base):
+    """Append-only suspension record (temporary device outage), one per
+    revision.
+
+    Suspension takes the grant out of the effective set immediately; the
+    original approval event is never rewritten.  A resumption event later
+    restores the same grant after re-adjudication.
+    """
+
+    __tablename__ = "suspension_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (Index("ix_suspension_events_application", "application_id"),)
+
+
+class ResumptionEvent(Base):
+    """Append-only resumption record, one per revision.
+
+    Restores a previously suspended grant into the effective set after it
+    has been re-adjudicated against every currently effective license under
+    the guard band in force at the resumption revision (a snapshot of which
+    is kept here).
+    """
+
+    __tablename__ = "resumption_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Guard band in force when the resumption was re-adjudicated.
+    guard_band: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (Index("ix_resumption_events_application", "application_id"),)
 
 
 class GuardBandEvent(Base):
